@@ -133,7 +133,9 @@ impl fmt::Debug for crate::Client {
 }
 
 impl<T: Transport> From<T> for Client {
-    fn from(t: T) -> Client { Client::with_transport(t) }
+    fn from(t: T) -> Client {
+        Client::with_transport(t)
+    }
 }
 
 /// Newtype around `Value` which allows hashing for use as hashmap keys,
@@ -199,9 +201,15 @@ mod tests {
 
     struct DummyTransport;
     impl Transport for DummyTransport {
-        fn send_request(&self, _: Request) -> Result<Response, Error> { Err(Error::NonceMismatch) }
-        fn send_batch(&self, _: &[Request]) -> Result<Vec<Response>, Error> { Ok(vec![]) }
-        fn fmt_target(&self, _: &mut fmt::Formatter) -> fmt::Result { Ok(()) }
+        fn send_request(&self, _: Request) -> Result<Response, Error> {
+            Err(Error::NonceMismatch)
+        }
+        fn send_batch(&self, _: &[Request]) -> Result<Vec<Response>, Error> {
+            Ok(vec![])
+        }
+        fn fmt_target(&self, _: &mut fmt::Formatter) -> fmt::Result {
+            Ok(())
+        }
     }
 
     #[test]

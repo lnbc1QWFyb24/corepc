@@ -92,11 +92,15 @@ impl error::Error for Error {
 }
 
 impl From<io::Error> for Error {
-    fn from(e: io::Error) -> Self { Error::SocketError(e) }
+    fn from(e: io::Error) -> Self {
+        Error::SocketError(e)
+    }
 }
 
 impl From<serde_json::Error> for Error {
-    fn from(e: serde_json::Error) -> Self { Error::Json(e) }
+    fn from(e: serde_json::Error) -> Self {
+        Error::Json(e)
+    }
 }
 
 impl From<Error> for crate::error::Error {

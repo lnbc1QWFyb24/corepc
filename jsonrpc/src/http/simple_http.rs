@@ -47,6 +47,10 @@ pub struct SimpleHttpTransport {
     proxy_addr: net::SocketAddr,
     #[cfg(feature = "proxy")]
     proxy_auth: Option<(String, String)>,
+    #[cfg(feature = "proxy")]
+    target_host: Option<String>,
+    #[cfg(feature = "proxy")]
+    target_port: u16,
     sock: Arc<Mutex<Option<BufReader<TcpStream>>>>,
 }
 
@@ -67,6 +71,10 @@ impl Default for SimpleHttpTransport {
             ),
             #[cfg(feature = "proxy")]
             proxy_auth: None,
+            #[cfg(feature = "proxy")]
+            target_host: None,
+            #[cfg(feature = "proxy")]
+            target_port: DEFAULT_PORT,
             sock: Arc::new(Mutex::new(None)),
         }
     }
@@ -74,21 +82,39 @@ impl Default for SimpleHttpTransport {
 
 impl SimpleHttpTransport {
     /// Constructs a new [`SimpleHttpTransport`] with default parameters.
-    pub fn new() -> Self { SimpleHttpTransport::default() }
+    pub fn new() -> Self {
+        SimpleHttpTransport::default()
+    }
 
     /// Returns a builder for [`SimpleHttpTransport`].
-    pub fn builder() -> Builder { Builder::new() }
+    pub fn builder() -> Builder {
+        Builder::new()
+    }
 
     /// Replaces the URL of the transport.
     pub fn set_url(&mut self, url: &str) -> Result<(), Error> {
-        let url = check_url(url)?;
-        self.addr = url.0;
-        self.path = url.1;
-        Ok(())
+        #[cfg(feature = "proxy")]
+        {
+            let url_parts = parse_url_for_proxy(url)?;
+            self.addr = url_parts.addr;
+            self.path = url_parts.path;
+            self.target_host = url_parts.hostname;
+            self.target_port = url_parts.port;
+            Ok(())
+        }
+        #[cfg(not(feature = "proxy"))]
+        {
+            let url = check_url(url)?;
+            self.addr = url.0;
+            self.path = url.1;
+            Ok(())
+        }
     }
 
     /// Replaces only the path part of the URL.
-    pub fn set_url_path(&mut self, path: String) { self.path = path; }
+    pub fn set_url_path(&mut self, path: String) {
+        self.path = path;
+    }
 
     fn request<R>(&self, req: impl serde::Serialize) -> Result<R, Error>
     where
@@ -106,15 +132,30 @@ impl SimpleHttpTransport {
 
     #[cfg(feature = "proxy")]
     fn fresh_socket(&self) -> Result<TcpStream, Error> {
-        let stream = if let Some((username, password)) = &self.proxy_auth {
-            Socks5Stream::connect_with_password(
-                self.proxy_addr,
-                self.addr,
-                username.as_str(),
-                password.as_str(),
-            )?
+        let stream = if let Some(ref target_host) = self.target_host {
+            // Use hostname-based connection for proxy (supports .onion addresses)
+            if let Some((username, password)) = &self.proxy_auth {
+                Socks5Stream::connect_with_password(
+                    self.proxy_addr,
+                    (target_host.as_str(), self.target_port),
+                    username.as_str(),
+                    password.as_str(),
+                )?
+            } else {
+                Socks5Stream::connect(self.proxy_addr, (target_host.as_str(), self.target_port))?
+            }
         } else {
-            Socks5Stream::connect(self.proxy_addr, self.addr)?
+            // Fallback to IP-based connection
+            if let Some((username, password)) = &self.proxy_auth {
+                Socks5Stream::connect_with_password(
+                    self.proxy_addr,
+                    self.addr,
+                    username.as_str(),
+                    password.as_str(),
+                )?
+            } else {
+                Socks5Stream::connect(self.proxy_addr, self.addr)?
+            }
         };
         Ok(stream.into_inner())
     }
@@ -277,6 +318,15 @@ impl SimpleHttpTransport {
     }
 }
 
+/// Result of URL parsing that includes optional hostname for proxy connections
+#[cfg(feature = "proxy")]
+struct UrlParts {
+    addr: SocketAddr,
+    path: String,
+    hostname: Option<String>,
+    port: u16,
+}
+
 /// Does some very basic manual URL parsing because the uri/url crates
 /// all have unicode-normalization as a dependency and that's broken.
 fn check_url(url: &str) -> Result<(SocketAddr, String), Error> {
@@ -336,6 +386,84 @@ fn check_url(url: &str) -> Result<(SocketAddr, String), Error> {
     }
 }
 
+/// Parse URL with support for keeping hostname for proxy connections
+#[cfg(feature = "proxy")]
+fn parse_url_for_proxy(url: &str) -> Result<UrlParts, Error> {
+    // The fallback port in case no port was provided.
+    // This changes when the http or https scheme was provided.
+    let mut fallback_port = DEFAULT_PORT;
+
+    // We need to get the hostname and the port.
+    // (1) Split scheme
+    let after_scheme = {
+        let mut split = url.splitn(2, "://");
+        let s = split.next().unwrap();
+        match split.next() {
+            None => s, // no scheme present
+            Some(after) => {
+                // Check if the scheme is http or https.
+                if s == "http" {
+                    fallback_port = 80;
+                } else if s == "https" {
+                    fallback_port = 443;
+                } else {
+                    return Err(Error::url(url, "scheme should be http or https"));
+                }
+                after
+            }
+        }
+    };
+    // (2) split off path
+    let (before_path, path) = {
+        if let Some(slash) = after_scheme.find('/') {
+            (&after_scheme[0..slash], &after_scheme[slash..])
+        } else {
+            (after_scheme, "/")
+        }
+    };
+    // (3) split off auth part
+    let after_auth = {
+        let mut split = before_path.splitn(2, '@');
+        let s = split.next().unwrap();
+        split.next().unwrap_or(s)
+    };
+
+    // (4) Parse hostname and port
+    let (hostname, port) = if let Some(colon_pos) = after_auth.rfind(':') {
+        let hostname = &after_auth[..colon_pos];
+        let port_str = &after_auth[colon_pos + 1..];
+        match port_str.parse::<u16>() {
+            Ok(p) => (hostname, p),
+            Err(_) => (after_auth, fallback_port),
+        }
+    } else {
+        (after_auth, fallback_port)
+    };
+
+    // Try to resolve the hostname, but keep it for proxy connections
+    let addr_str = format!("{}:{}", hostname, port);
+    let mut addrs = match addr_str.to_socket_addrs() {
+        Ok(addrs) => addrs,
+        Err(_) => {
+            // For .onion addresses or other unresolvable hostnames,
+            // create a dummy address since we'll use the hostname with the proxy
+            return Ok(UrlParts {
+                addr: SocketAddr::new(net::IpAddr::V4(net::Ipv4Addr::new(0, 0, 0, 0)), port),
+                path: path.to_owned(),
+                hostname: Some(hostname.to_owned()),
+                port,
+            });
+        }
+    };
+
+    match addrs.next() {
+        Some(addr) => {
+            Ok(UrlParts { addr, path: path.to_owned(), hostname: Some(hostname.to_owned()), port })
+        }
+        None => Err(Error::url(url, "invalid hostname: error extracting socket address")),
+    }
+}
+
 impl Transport for SimpleHttpTransport {
     fn send_request(&self, req: Request) -> Result<Response, crate::Error> {
         Ok(self.request(req)?)
@@ -358,7 +486,9 @@ pub struct Builder {
 
 impl Builder {
     /// Constructs a new [`Builder`] with default configuration.
-    pub fn new() -> Builder { Builder { tp: SimpleHttpTransport::new() } }
+    pub fn new() -> Builder {
+        Builder { tp: SimpleHttpTransport::new() }
+    }
 
     /// Sets the timeout after which requests will abort if they aren't finished.
     pub fn timeout(mut self, timeout: Duration) -> Self {
@@ -406,11 +536,15 @@ impl Builder {
     }
 
     /// Builds the final [`SimpleHttpTransport`].
-    pub fn build(self) -> SimpleHttpTransport { self.tp }
+    pub fn build(self) -> SimpleHttpTransport {
+        self.tp
+    }
 }
 
 impl Default for Builder {
-    fn default() -> Self { Builder::new() }
+    fn default() -> Self {
+        Builder::new()
+    }
 }
 
 impl crate::Client {
@@ -573,11 +707,15 @@ impl error::Error for Error {
 }
 
 impl From<io::Error> for Error {
-    fn from(e: io::Error) -> Self { Error::SocketError(e) }
+    fn from(e: io::Error) -> Self {
+        Error::SocketError(e)
+    }
 }
 
 impl From<serde_json::Error> for Error {
-    fn from(e: serde_json::Error) -> Self { Error::Json(e) }
+    fn from(e: serde_json::Error) -> Self {
+        Error::Json(e)
+    }
 }
 
 impl From<Error> for crate::Error {
@@ -609,14 +747,24 @@ mod impls {
         }
     }
     impl Write for TcpStream {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> { io::sink().write(buf) }
-        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            io::sink().write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     impl TcpStream {
-        pub fn connect_timeout(_: &SocketAddr, _: Duration) -> io::Result<Self> { Ok(TcpStream) }
-        pub fn set_read_timeout(&self, _: Option<Duration>) -> io::Result<()> { Ok(()) }
-        pub fn set_write_timeout(&self, _: Option<Duration>) -> io::Result<()> { Ok(()) }
+        pub fn connect_timeout(_: &SocketAddr, _: Duration) -> io::Result<Self> {
+            Ok(TcpStream)
+        }
+        pub fn set_read_timeout(&self, _: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
+        pub fn set_write_timeout(&self, _: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
     }
 }
 
@@ -675,6 +823,11 @@ mod tests {
             assert_eq!(builder.tp.proxy_addr, SocketAddr::from_str("127.0.0.1:9050").unwrap());
         }
 
+        // When proxy feature is enabled, invalid hostnames are allowed since they'll be
+        // resolved by the SOCKS proxy (e.g., .onion addresses).
+        #[cfg(feature = "proxy")]
+        let invalid_urls = ["httpx://127.0.0.1:8080/", "ftp://127.0.0.1:8080/rpc/test"];
+        #[cfg(not(feature = "proxy"))]
         let invalid_urls = [
             "127.0.0.1.0:8080",
             "httpx://127.0.0.1:8080/",
@@ -724,6 +877,23 @@ mod tests {
             Some(("user", "password")),
         )
         .unwrap();
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn test_onion_address() {
+        // Test that .onion addresses are properly handled with proxy
+        let onion_url = "http://someonionaddress.onion:8332/";
+        let builder = Builder::new().url(onion_url).unwrap().proxy_addr("127.0.0.1:9050").unwrap();
+        let tp = builder.build();
+
+        // Verify that the hostname is preserved for proxy connection
+        assert_eq!(tp.target_host, Some("someonionaddress.onion".to_string()));
+        assert_eq!(tp.target_port, 8332);
+        assert_eq!(tp.path, "/");
+
+        // The actual socket address doesn't matter for .onion addresses
+        // since they'll be resolved by the SOCKS proxy
     }
 
     /// Test that the client will detect that a socket is closed and open a fresh one before sending

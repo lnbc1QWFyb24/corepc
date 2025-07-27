@@ -113,7 +113,9 @@ impl Response {
     }
 
     /// Returns whether or not the `result` field is empty.
-    pub fn is_none(&self) -> bool { self.result.is_none() }
+    pub fn is_none(&self) -> bool {
+        self.result.is_none()
+    }
 }
 
 #[cfg(test)]
